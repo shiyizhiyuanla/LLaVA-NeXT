@@ -1035,10 +1035,12 @@ class LazySupervisedDataset(Dataset):
         self.data_args = data_args
 
     def __len__(self):
+        # 数据集长度
         return len(self.list_data_dict)
 
     @property
     def lengths(self):
+        # toekn长度
         length_list = []
         for sample in self.list_data_dict:
             img_tokens = 128 if "image" in sample else 0
@@ -1219,6 +1221,7 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
+        # 如果样本中包含图像或视频数据，将处理后的图像数据添加到 data_dict 中。如果模型是多模态的且样本中没有图像或视频数据，生成一个默认的图像张量并添加到 data_dict 中。
         # image exist in the data
         if "image" in self.list_data_dict[i]:
             data_dict["image"] = image
@@ -1452,6 +1455,7 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # 日志记录
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")
         rank0_print(f"model_args = {vars(model_args)}\n\n")
@@ -1459,9 +1463,11 @@ def train(attn_implementation=None):
         rank0_print(f"training_args = {vars(training_args)}\n\n")
         # rank0_print(f"evaluation_args = {vars(evaluation_args)}\n\n")
 
+    # 选择计算类型（FP16, BF16, FP32）
     local_rank = training_args.local_rank
     compute_dtype = torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
 
+    # 配置量化参数
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -1483,6 +1489,7 @@ def train(attn_implementation=None):
             )
         )
 
+    # 加载模型
     model = get_model(model_args, training_args, bnb_model_from_pretrained_args)
     model.config.use_cache = False
     if model_args.rope_scaling_factor is not None and model_args.rope_scaling_type is not None:
@@ -1491,15 +1498,18 @@ def train(attn_implementation=None):
             "type": model_args.rope_scaling_type,
         }
 
+    # 冻结backbone
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
+    # 模型量化
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
 
         model.config.torch_dtype = torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
+    # gradient_checkpointing
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -1510,6 +1520,7 @@ def train(attn_implementation=None):
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
+    # 配置LoRA
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
@@ -1529,6 +1540,7 @@ def train(attn_implementation=None):
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
+    # 初始化 Tokenizer
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
     elif "qwen" in model_args.model_name_or_path.lower():
@@ -1549,6 +1561,8 @@ def train(attn_implementation=None):
             use_fast=False,
         )
 
+    # 多模态配置
+    # Tokenizer 配置
     rank0_print(f"Prompt version: {model_args.version}")
     if model_args.version == "v0":
         if tokenizer.pad_token is None:
@@ -1567,6 +1581,7 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+    # 初始化视觉模块
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
@@ -1662,6 +1677,7 @@ def train(attn_implementation=None):
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
                         param.requires_grad_(True)
 
+        # 参数统计
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
@@ -1690,6 +1706,7 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # 创建数据模块和训练器
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
